@@ -1,0 +1,188 @@
+pipeline {
+  agent any
+
+  parameters {
+    text(
+      name: 'TARGET_ACCOUNT_IDS',
+      defaultValue: '442889374161\n751939631119',
+      description: 'One AWS account ID per line (or comma separated).'
+    )
+  }
+
+  environment {
+    ROLE_NAME = "Jenkins-CrossAccount-Admin"
+    SESSION_NAME = "jenkins-session"
+    FAILURE_THRESHOLD = "10"
+    ACCESS_DENIED_THRESHOLD = "9999"
+  }
+
+  stages {
+    stage('Assume Role & Tag S3 for multiple accounts') {
+      steps {
+        withEnv(["TARGET_ACCOUNT_IDS=${params.TARGET_ACCOUNT_IDS}"]) {
+          sh '''
+          #!/bin/bash
+          set -euo pipefail
+
+          ROLE_NAME="${ROLE_NAME}"
+          SESSION_NAME="${SESSION_NAME}"
+          FAILURE_THRESHOLD=${FAILURE_THRESHOLD:-10}
+          ACCESS_DENIED_THRESHOLD=${ACCESS_DENIED_THRESHOLD:-9999}
+
+          raw="${TARGET_ACCOUNT_IDS:-}"
+          if [ -z "$raw" ]; then
+            echo "No TARGET_ACCOUNT_IDS provided. Exiting."
+            exit 1
+          fi
+
+          # Normalize separators: commas -> newlines, remove CR, trim spaces
+          normalized=$(echo "$raw" | tr ',' '\\n' | tr -d '\\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+          # Build array safely using mapfile
+          mapfile -t accounts < <(printf '%s\n' "$normalized")
+
+          total_accounts=0
+          skipped_accounts=0
+          failures=0
+          access_denied_count=0
+          assume_failures=0
+
+          for acct in "${accounts[@]}"; do
+            acct=$(echo "$acct" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$acct" ] && continue
+
+            total_accounts=$((total_accounts+1))
+
+            if ! [[ "$acct" =~ ^[0-9]{12}$ ]]; then
+              echo "Skipping invalid account id: '$acct' (must be 12 digits)"
+              skipped_accounts=$((skipped_accounts+1))
+              continue
+            fi
+
+            echo "========================================"
+            echo "Processing account: $acct"
+            echo "========================================"
+
+            ROLE_ARN="arn:aws:iam::${acct}:role/${ROLE_NAME}"
+
+            # Assume role; treat assume-role failure as account-level failure
+            CREDS=$(aws sts assume-role \
+              --role-arn "$ROLE_ARN" \
+              --role-session-name "${SESSION_NAME}-${acct}" \
+              --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+              --output text 2>assume_err.txt) || {
+                echo "Failed to assume role in account $acct. Error:"
+                sed -n '1,200p' assume_err.txt || true
+                rm -f assume_err.txt
+                assume_failures=$((assume_failures+1))
+                # do not treat this as a global 'failures' for bucket tagging
+                continue
+            }
+            rm -f assume_err.txt
+
+            read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< "$CREDS"
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+            echo "Assumed role in account $acct. Caller identity:"
+            aws sts get-caller-identity || true
+
+            # List buckets (may include buckets owned by other accounts; errors tolerated)
+            buckets=$(aws s3api list-buckets --query "Buckets[].Name" --output text 2>/dev/null || echo "")
+            if [ -z "$buckets" ]; then
+              echo "No buckets found in account $acct (or no permission to list)."
+              unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+              continue
+            fi
+
+            for bucket in $buckets; do
+              echo "Processing bucket: $bucket"
+
+              # Determine region safely
+              region=$(aws s3api get-bucket-location --bucket "$bucket" --query "LocationConstraint" --output text 2>/dev/null || echo "")
+              if [[ "$region" == "None" || "$region" == "null" || -z "$region" ]]; then
+                region="us-east-1"
+              fi
+
+              # Try to get tags; if not allowed or no tags, tags_json will be empty
+              tags_json=$(aws s3api get-bucket-tagging --bucket "$bucket" --region "$region" --output json 2>/dev/null || echo "")
+
+              if [ -z "$tags_json" ]; then
+                # No tags present or cannot read tags; attempt to add Name tag
+                tagging_json=$(jq -n --arg k "Name" --arg v "$bucket" '{TagSet:[{Key:$k,Value:$v}]}' | jq -c .)
+                # capture stderr to classify errors
+                if aws s3api put-bucket-tagging --bucket "$bucket" --region "$region" --tagging "$tagging_json" 2>err.txt; then
+                  echo "Added Name tag → $bucket"
+                else
+                  echo "Failed to add Name tag → $bucket. Error:"
+                  sed -n '1,200p' err.txt || true
+                  # classify error: AccessDenied vs other
+                  if grep -qi "AccessDenied" err.txt || grep -qi "explicit deny" err.txt || grep -qi "Not authorized" err.txt; then
+                    echo "AccessDenied or explicit deny detected for bucket $bucket — skipping without counting as a tagging failure."
+                    access_denied_count=$((access_denied_count+1))
+                  else
+                    echo "Non-AccessDenied error for bucket $bucket — counting as failure."
+                    failures=$((failures+1))
+                  fi
+                  rm -f err.txt
+                fi
+                continue
+              fi
+
+              # If Name tag already exists, skip
+              if echo "$tags_json" | jq -e '.TagSet[] | select(.Key=="Name")' >/dev/null 2>&1; then
+                echo "Name tag already exists → $bucket"
+                continue
+              fi
+
+              # Append Name tag and push updated TagSet
+              updated=$(echo "$tags_json" | jq --arg name "$bucket" '.TagSet += [{Key:"Name",Value:$name}]')
+              tagging_payload=$(echo "$updated" | jq -c '{TagSet:.TagSet}')
+
+              if aws s3api put-bucket-tagging --bucket "$bucket" --region "$region" --tagging "$tagging_payload" 2>err.txt; then
+                echo "Added Name tag → $bucket"
+              else
+                echo "Failed to update tags for $bucket. Error:"
+                sed -n '1,200p' err.txt || true
+                if grep -qi "AccessDenied" err.txt || grep -qi "explicit deny" err.txt || grep -qi "Not authorized" err.txt; then
+                  echo "AccessDenied or explicit deny detected for bucket $bucket — skipping without counting as a tagging failure."
+                  access_denied_count=$((access_denied_count+1))
+                else
+                  echo "Non-AccessDenied error for bucket $bucket — counting as failure."
+                  failures=$((failures+1))
+                fi
+                rm -f err.txt
+              fi
+            done
+
+            # Unset temporary AWS env vars before next account
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          done
+
+          echo "======================================"
+          echo "Summary: total_accounts_provided=$total_accounts, skipped_accounts=$skipped_accounts, assume_failures=$assume_failures, tagging_failures=$failures, access_denied=$access_denied_count"
+          echo "======================================"
+
+          # Fail only on real tagging failures or too many assume-role failures
+          if [ "$assume_failures" -gt 0 ]; then
+            echo "One or more accounts failed to assume role. Failing the build."
+            exit 1
+          fi
+
+          if [ "$failures" -gt "$FAILURE_THRESHOLD" ]; then
+            echo "Too many tagging failures ($failures). Failing the build."
+            exit 1
+          fi
+
+          # Optional: fail if access_denied_count exceeds threshold
+          if [ "$access_denied_count" -gt "$ACCESS_DENIED_THRESHOLD" ]; then
+            echo "Too many AccessDenied occurrences ($access_denied_count). Failing the build."
+            exit 1
+          fi
+
+          exit 0
+          '''
+        }
+      }
+    }
+  }
+}
